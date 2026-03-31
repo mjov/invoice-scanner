@@ -72,6 +72,7 @@ video{width:100%;height:100%;object-fit:cover;display:block}
 .pdot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}
 .pdot.scan{background:var(--lime);animation:blink 1.4s ease-in-out infinite}
 .pdot.found{background:var(--cyan)}
+.pdot.warn{background:var(--amber)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 .cam-off-wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;aspect-ratio:1;background:var(--ink2);border:1px solid var(--line);border-radius:var(--r);color:var(--muted)}
 .cam-off-wrap svg{opacity:.22}
@@ -348,58 +349,64 @@ function go(tab){
   document.querySelector('.content').scrollTop=0;
 }
 
-// Persistent canvas reused every frame — avoids GC pressure on mobile
-let scanCanvas=null, scanCtx=null, scanTimer=null;
+let scanCanvas=null, scanCtx=null, scanTimer=null, scanFrameCount=0;
 
 async function startCam(){
-  try{
-    // Request highest quality rear camera
-    const constraints={
-      video:{
-        facingMode:{ideal:'environment'},
-        width:{ideal:1920},
-        height:{ideal:1080},
-        focusMode:'continuous'
-      }
-    };
+  setCamStatus('scan','Starting camera...');
+
+  // Step 1: try rear camera with basic constraints (no focusMode — breaks iOS)
+  const tryStart=async(constraints)=>{
     videoStream=await navigator.mediaDevices.getUserMedia(constraints);
     const v=document.getElementById('video');
     v.srcObject=videoStream;
-    await v.play();
+    // Don't await play() — just call it; mobile browsers handle it async
+    v.play().catch(()=>{});
+    // Wait for video to have real dimensions (up to 5s)
+    await new Promise((resolve,reject)=>{
+      let tries=0;
+      const check=setInterval(()=>{
+        tries++;
+        if(v.videoWidth>0&&v.videoHeight>0){clearInterval(check);resolve();}
+        if(tries>50){clearInterval(check);reject(new Error('Video did not load'));}
+      },100);
+    });
+  };
 
-    // Pre-create canvas once
+  try{
+    try{
+      await tryStart({video:{facingMode:{exact:'environment'},width:{ideal:1280},height:{ideal:720}}});
+    }catch(e1){
+      // exact environment failed — try ideal
+      try{
+        await tryStart({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}});
+      }catch(e2){
+        // any camera
+        await tryStart({video:true});
+      }
+    }
+
     scanCanvas=document.createElement('canvas');
     scanCtx=scanCanvas.getContext('2d',{willReadFrequently:true});
+    scanFrameCount=0;
 
     document.getElementById('cam-idle').style.display='none';
     document.getElementById('cam-live').style.display='block';
     scanning=true;
 
-    // Show torch button if device supports it
-    const track=videoStream.getVideoTracks()[0];
-    if(track&&track.getCapabilities&&track.getCapabilities().torch){
-      document.getElementById('btn-torch').style.display='flex';
+    // Torch support check
+    const track=videoStream&&videoStream.getVideoTracks()[0];
+    if(track&&track.getCapabilities){
+      try{const caps=track.getCapabilities();if(caps.torch)document.getElementById('btn-torch').style.display='flex';}catch(_){}
     }
 
-    // Use interval at 8fps instead of rAF — gives camera time to focus between reads
-    scanTimer=setInterval(tick, 120);
+    setCamStatus('scan','Hold QR code steady in frame');
+    // 6fps — reliable on all mobile browsers
+    scanTimer=setInterval(tick,160);
+
   }catch(e){
-    console.error('Camera error:',e);
-    // Try fallback with minimal constraints
-    try{
-      videoStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
-      const v=document.getElementById('video');
-      v.srcObject=videoStream;
-      await v.play();
-      scanCanvas=document.createElement('canvas');
-      scanCtx=scanCanvas.getContext('2d',{willReadFrequently:true});
-      document.getElementById('cam-idle').style.display='none';
-      document.getElementById('cam-live').style.display='block';
-      scanning=true;
-      scanTimer=setInterval(tick,120);
-    }catch(e2){
-      toast('Camera access denied. Enable camera permission in browser settings.','err');
-    }
+    console.error('Camera failed:',e);
+    toast('Camera error: '+e.message,'err');
+    setCamStatus('warn','Camera failed — use manual URL entry below');
   }
 }
 
@@ -413,43 +420,42 @@ function stopCam(){
   document.getElementById('btn-torch').style.display='none';
 }
 
+function setCamStatus(state,msg){
+  const dot=document.getElementById('pdot');
+  const txt=document.getElementById('cmsg');
+  if(dot) dot.className='pdot'+(state==='scan'?' scan':state==='found'?' found':state==='warn'?' warn':'');
+  if(txt) txt.textContent=msg;
+}
+
 function tick(){
   if(!scanning) return;
   const v=document.getElementById('video');
-  // Wait until video has actual dimensions
-  if(!v||v.readyState<2||v.videoWidth===0||v.videoHeight===0) return;
+  if(!v||v.videoWidth===0||v.videoHeight===0) return;
 
-  // Scale down large frames for faster jsQR processing — 640px wide is plenty
+  scanFrameCount++;
+  // Update status every ~2s to show scanner is alive
+  if(scanFrameCount%12===0) setCamStatus('scan','Scanning... (frame '+scanFrameCount+')');
+
+  // Downscale to 640px max for speed — jsQR works fine at this resolution
   const maxW=640;
-  const scale=Math.min(1, maxW/v.videoWidth);
-  const w=Math.round(v.videoWidth*scale);
-  const h=Math.round(v.videoHeight*scale);
+  const scale=Math.min(1,maxW/v.videoWidth);
+  const w=Math.round(v.videoWidth*scale)||640;
+  const h=Math.round(v.videoHeight*scale)||480;
 
-  if(scanCanvas.width!==w||scanCanvas.height!==h){
-    scanCanvas.width=w;
-    scanCanvas.height=h;
-  }
-  scanCtx.drawImage(v,0,0,w,h);
+  if(scanCanvas.width!==w||scanCanvas.height!==h){scanCanvas.width=w;scanCanvas.height=h;}
+  try{scanCtx.drawImage(v,0,0,w,h);}catch(e){return;}
   const imageData=scanCtx.getImageData(0,0,w,h);
 
-  // Try both normal and inverted (handles dark-on-light AND light-on-dark QR codes)
-  let code=jsQR(imageData.data,imageData.width,imageData.height,{inversionAttempts:'attemptBoth'});
+  // attemptBoth handles dark-on-light and light-on-dark QR codes
+  const code=jsQR(imageData.data,imageData.width,imageData.height,{inversionAttempts:'attemptBoth'});
 
-  if(code&&code.data&&code.data.length>0){
-    // Debounce — ignore if same code detected within 2s
-    if(code.data===tick._lastCode&&Date.now()-tick._lastTime<2000) return;
-    tick._lastCode=code.data;
-    tick._lastTime=Date.now();
-
-    document.getElementById('pdot').className='pdot found';
-    document.getElementById('cmsg').textContent='QR detected!';
+  if(code&&code.data&&code.data.trim().length>4){
+    setCamStatus('found','QR detected!');
     stopCam();
-    showUrl(code.data);
-    processUrl(code.data);
+    showUrl(code.data.trim());
+    processUrl(code.data.trim());
   }
 }
-tick._lastCode=null;
-tick._lastTime=0;
 async function toggleTorch(){
   if(!videoStream) return;
   const track=videoStream.getVideoTracks()[0];
