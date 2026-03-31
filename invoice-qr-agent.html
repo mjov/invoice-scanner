@@ -299,11 +299,13 @@ video{width:100%;height:100%;object-fit:cover;display:block}
       <div class="scard">
         <div class="stitle"><div class="snum">4</div>Sheet Column Layout</div>
         <div class="col-map">
-          <span class="c">A</span> Date &nbsp; <span class="c">B</span> Invoice # &nbsp; <span class="c">C</span> Seller &nbsp; <span class="c">D</span> Buyer<br>
-          <span class="c">E</span> Tax Base &nbsp; <span class="c">F</span> VAT &nbsp; <span class="c">G</span> Total &nbsp; <span class="c">H</span> Currency<br>
-          <span class="c">I</span> Type &nbsp; <span class="c">J</span> Due Date &nbsp; <span class="c">K</span> Source URL &nbsp; <span class="c">L</span> Scanned At
+          <span class="c">A</span> Date &nbsp; <span class="c">B</span> Invoice # &nbsp; <span class="c">C</span> Seller &nbsp; <span class="c">D</span> Seller Tax ID<br>
+          <span class="c">E</span> Buyer &nbsp; <span class="c">F</span> Buyer Tax ID &nbsp; <span class="c">G</span> Type &nbsp; <span class="c">H</span> Currency<br>
+          <span class="c">I</span> Tax Base &nbsp; <span class="c">J</span> VAT &nbsp; <span class="c">K</span> Total &nbsp; <span class="c">L</span> Due Date<br>
+          <span class="c">M</span> Source URL &nbsp; <span class="c">N</span> Scanned At<br>
+          <span class="c">O</span> Item Name &nbsp; <span class="c">P</span> Qty &nbsp; <span class="c">Q</span> Unit &nbsp; <span class="c">R</span> Unit Price &nbsp; <span class="c">S</span> VAT Rate &nbsp; <span class="c">T</span> Item Total
         </div>
-        <div class="hint" style="margin-top:8px">Each invoice is appended as a new row. Headers are not added automatically — add them manually to row 1 if you want them.</div>
+        <div class="hint" style="margin-top:8px">One row per line item. Invoice header fields (A–N) repeat on each row for easy filtering. If no line items are detected, one summary row is saved.</div>
       </div>
     </div>
 
@@ -574,19 +576,49 @@ async function saveToSheets(){
   if(!cfg.sheetId){toast('Set Spreadsheet ID in Setup tab','err');go('setup');return;}
   loader('Saving to Google Sheets…');
   try{
-    const row=[
-      currentInv.date||'',currentInv.invoiceNumber||'',currentInv.seller||'',currentInv.buyer||'',
-      currentInv.taxBase??'',currentInv.vatAmount??'',currentInv.total??'',currentInv.currency||'',
-      currentInv.invoiceType||'',currentInv.dueDate||'',currentInv.sourceUrl||'',new Date().toISOString()
+    const inv=currentInv;
+    const scannedAt=new Date().toISOString();
+    // Header fields repeated on every row for easy filtering/pivoting
+    const header=[
+      inv.date||'',
+      inv.invoiceNumber||'',
+      inv.seller||'',
+      inv.sellerTaxId||'',
+      inv.buyer||'',
+      inv.buyerTaxId||'',
+      inv.invoiceType||'',
+      inv.currency||'',
+      inv.taxBase??'',
+      inv.vatAmount??'',
+      inv.total??'',
+      inv.dueDate||'',
+      inv.sourceUrl||'',
+      scannedAt
     ];
-    // Sheets API range: quote tab name with single quotes to handle spaces/special chars
-    // Only encode the tab name itself, NOT the ! or column range
+
+    let rows=[];
+    if(inv.items&&inv.items.length>0){
+      // One row per line item — header fields + item fields
+      rows=inv.items.map(it=>[
+        ...header,
+        it.name||'',
+        it.quantity??'',
+        it.unit||'',
+        it.unitPrice??'',
+        it.vatRate||'',
+        it.totalPrice??''
+      ]);
+    }else{
+      // No line items — save single summary row with empty item columns
+      rows=[[ ...header, '','','','','','' ]];
+    }
+
     const tabName=cfg.sheetTab||'Invoices';
-    const range=encodeURIComponent("'"+tabName+"'")+'!A:L';
+    const range=encodeURIComponent("'"+tabName+"'")+'!A:T';
     const r=await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${cfg.sheetId}/values/${range}:append?valueInputOption=USER_ENTERED`,{
       method:'POST',
       headers:{'Authorization':'Bearer '+oauthToken,'Content-Type':'application/json'},
-      body:JSON.stringify({values:[row]})
+      body:JSON.stringify({values:rows})
     });
     if(!r.ok){
       const e=await r.json();
@@ -594,10 +626,11 @@ async function saveToSheets(){
       if(r.status===401){oauthToken=null;updateAuthUI(false);throw new Error('Google session expired. Please sign in again in Setup tab.');}
       throw new Error(msg);
     }
-    const saved={...currentInv,_savedAt:new Date().toISOString(),_savedToSheet:true};
+    const saved={...inv,_savedAt:scannedAt,_savedToSheet:true};
     hist.unshift(saved);if(hist.length>100)hist=hist.slice(0,100);
     localStorage.setItem('iscan_hist',JSON.stringify(hist));
-    toast('Saved to Google Sheets ✓','lime');
+    const itemCount=inv.items&&inv.items.length>0?inv.items.length:1;
+    toast('Saved '+itemCount+' row'+(itemCount>1?'s':'')+'  to Google Sheets ✓','lime');
   }catch(e){toast('Error: '+e.message,'err');}
   loaderOff();
 }
