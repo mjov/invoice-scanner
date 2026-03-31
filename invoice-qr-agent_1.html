@@ -323,10 +323,10 @@ video{width:100%;height:100%;object-fit:cover;display:block}
 <div class="toast" id="toast"></div>
 
 <script>
-const MODEL = 'claude-3-5-sonnet-20241022'; // Updated to a more recent stable model
+const MODEL = 'claude-sonnet-4-20250514';
 let cfg = JSON.parse(localStorage.getItem('iscan_cfg')||'{}');
 let hist = JSON.parse(localStorage.getItem('iscan_hist')||'[]');
-let videoStream=null, scanning=false, currentInv=null, oauthToken=null, oauthUser=null;
+let videoStream=null, scanning=false, rafId=null, currentInv=null, oauthToken=null, oauthUser=null;
 
 function go(tab){
   document.querySelectorAll('.nb').forEach((b,i)=>b.classList.toggle('on',['scan','invoice','setup','history'][i]===tab));
@@ -334,6 +334,7 @@ function go(tab){
   document.getElementById('panel-'+tab).classList.add('on');
   if(tab==='history') renderHist();
   if(tab==='setup') loadCfg();
+  document.querySelector('.content').scrollTop=0;
 }
 
 async function startCam(){
@@ -343,11 +344,12 @@ async function startCam(){
     v.srcObject=videoStream; await v.play();
     document.getElementById('cam-idle').style.display='none';
     document.getElementById('cam-live').style.display='block';
-    scanning=true; tick();
+    scanning=true; rafId=requestAnimationFrame(tick);
   }catch(e){toast('Camera denied — use manual URL entry','err');}
 }
 function stopCam(){
   scanning=false;
+  if(rafId){cancelAnimationFrame(rafId);rafId=null;}
   if(videoStream){videoStream.getTracks().forEach(t=>t.stop());videoStream=null;}
   document.getElementById('cam-live').style.display='none';
   document.getElementById('cam-idle').style.display='block';
@@ -355,7 +357,7 @@ function stopCam(){
 function tick(){
   if(!scanning) return;
   const v=document.getElementById('video');
-  if(v.readyState<2){requestAnimationFrame(tick);return;}
+  if(v.readyState<2){rafId=requestAnimationFrame(tick);return;}
   const c=document.createElement('canvas');
   c.width=v.videoWidth;c.height=v.videoHeight;
   c.getContext('2d').drawImage(v,0,0);
@@ -369,7 +371,7 @@ function tick(){
     processUrl(code.data);
     return;
   }
-  requestAnimationFrame(tick);
+  rafId=requestAnimationFrame(tick);
 }
 function showUrl(url){
   const b=document.getElementById('surl');
@@ -378,6 +380,10 @@ function showUrl(url){
 function processManual(){
   const url=document.getElementById('manual-url').value.trim();
   if(!url){toast('Enter a URL first','err');return;}
+  // Reset invoice panel to empty state for fresh extraction
+  document.getElementById('inv-empty').style.display='block';
+  document.getElementById('inv-content').style.display='none';
+  currentInv=null;
   showUrl(url);processUrl(url);
 }
 
@@ -391,11 +397,11 @@ function decodePFRBinary(vl){
     const version=bytes[0];
     let journal='';
     for(let i=1;i<=16;i++) journal+=String.fromCharCode(bytes[i]);
-    const totalPara=bytes[17]|(bytes[18]<<8)|(bytes[19]<<16)|(bytes[20]<<24);
+    const totalPara=(bytes[17]|(bytes[18]<<8)|(bytes[19]<<16)|(bytes[20]<<24))>>>0;
     const total=parseFloat((totalPara/100).toFixed(2));
-    const taxPara=bytes[21]|(bytes[22]<<8)|(bytes[23]<<16)|(bytes[24]<<24);
+    const taxPara=(bytes[21]|(bytes[22]<<8)|(bytes[23]<<16)|(bytes[24]<<24))>>>0;
     const taxBase=parseFloat((taxPara/100).toFixed(2));
-    const counter=bytes[25]|(bytes[26]<<8)|(bytes[27]<<16)|(bytes[28]<<24);
+    const counter=(bytes[25]|(bytes[26]<<8)|(bytes[27]<<16)|(bytes[28]<<24))>>>0;
     return {version,journal:journal.trim(),total,taxBase,counter,currency:'RSD'};
   }catch(e){return null;}
 }
@@ -503,7 +509,7 @@ async function processUrl(url){
         if(!inv.invoiceNumber) inv.invoiceNumber=bin.journal;
         if(!inv.invoiceStandard) inv.invoiceStandard='PFR e-Racun';
         if(inv.total&&!inv.taxBase){
-          inv.taxBase=parseFloat((inv.total/1.20).toFixed(2));
+          inv.taxBase=parseFloat((inv.total/1.2).toFixed(2));
           inv.vatAmount=parseFloat((inv.total-inv.taxBase).toFixed(2));
           if(!inv.notes) inv.notes='VAT breakdown estimated at E2 (20%) from confirmed total';
         }
@@ -545,7 +551,8 @@ function renderInv(inv){
   document.getElementById('cdots').innerHTML=Array.from({length:3},(_,i)=>`<div class="cd${i<count?' on '+cls:''}"></div>`).join('');
   set('conf-lbl','confidence: '+lvl+(inv.invoiceStandard?' · '+inv.invoiceStandard:''));
 }
-function set(id,val){const e=document.getElementById(id);if(e)e.textContent=val;}
+function set(id,val){const e=document.getElementById(id);if(e)e.textContent=val||'';}
+function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function fmt(n,cur){return new Intl.NumberFormat('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n)+' '+(cur||'');}
 
 async function saveToSheets(){
@@ -565,7 +572,12 @@ async function saveToSheets(){
       headers:{'Authorization':'Bearer '+oauthToken,'Content-Type':'application/json'},
       body:JSON.stringify({values:[row]})
     });
-    if(!r.ok){const e=await r.json();throw new Error(e.error?.message||'Sheets API error');}
+    if(!r.ok){
+      const e=await r.json();
+      const msg=e.error?.message||'Sheets API error';
+      if(r.status===401){oauthToken=null;updateAuthUI(false);throw new Error('Google session expired. Please sign in again in Setup tab.');}
+      throw new Error(msg);
+    }
     const saved={...currentInv,_savedAt:new Date().toISOString(),_savedToSheet:true};
     hist.unshift(saved);if(hist.length>100)hist=hist.slice(0,100);
     localStorage.setItem('iscan_hist',JSON.stringify(hist));
@@ -670,7 +682,7 @@ function renderHist(){
   const list=document.getElementById('hist-list'),empty=document.getElementById('hist-empty'),btn=document.getElementById('btn-clear');
   if(!hist.length){empty.style.display='block';list.innerHTML='';btn.style.display='none';return;}
   empty.style.display='none';btn.style.display='flex';
-  list.innerHTML=hist.map((inv,i)=>`<div class="hi" onclick="loadHist(${i})"><div class="hi-top"><div class="hi-name">${inv.seller||'Unknown Seller'}</div><div class="hi-total">${inv.total!=null?fmt(inv.total,inv.currency):'—'}</div></div><div class="hi-meta"><span>${inv.invoiceNumber?'#'+inv.invoiceNumber:'No number'}</span><span>${inv.date||'No date'}</span><span>${inv.buyer||'—'}</span></div>${inv._savedToSheet?'<div class="hi-saved">✓ saved to Sheets · '+(inv._savedAt?new Date(inv._savedAt).toLocaleDateString():'')+'</div>':''}</div>`).join('');
+  list.innerHTML=hist.map((inv,i)=>`<div class="hi" onclick="loadHist(${i})"><div class="hi-top"><div class="hi-name">${esc(inv.seller)||'Unknown Seller'}</div><div class="hi-total">${inv.total!=null?fmt(inv.total,inv.currency):'—'}</div></div><div class="hi-meta"><span>${inv.invoiceNumber?'#'+esc(inv.invoiceNumber):'No number'}</span><span>${esc(inv.date)||'No date'}</span><span>${esc(inv.buyer)||'—'}</span></div>${inv._savedToSheet?'<div class="hi-saved">✓ saved to Sheets · '+(inv._savedAt?new Date(inv._savedAt).toLocaleDateString():'')+'</div>':''}</div>`).join('');
 }
 function loadHist(i){currentInv=hist[i];renderInv(hist[i]);go('invoice');}
 function clearHist(){if(!confirm('Clear all history?'))return;hist=[];localStorage.removeItem('iscan_hist');renderHist();}
