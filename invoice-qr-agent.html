@@ -15,7 +15,7 @@
 <link rel="apple-touch-icon" href="icon-192.png">
 
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
 <style>
 :root {
   --ink: #0d0f14;
@@ -338,7 +338,7 @@ video{width:100%;height:100%;object-fit:cover;display:block}
 const MODEL = 'claude-sonnet-4-20250514';
 let cfg = JSON.parse(localStorage.getItem('iscan_cfg')||'{}');
 let hist = JSON.parse(localStorage.getItem('iscan_hist')||'[]');
-let videoStream=null, scanning=false, rafId=null, currentInv=null, oauthToken=null, oauthUser=null;
+let videoStream=null, scanning=false, currentInv=null, oauthToken=null, oauthUser=null;
 
 function go(tab){
   document.querySelectorAll('.nb').forEach((b,i)=>b.classList.toggle('on',['scan','invoice','setup','history'][i]===tab));
@@ -349,112 +349,72 @@ function go(tab){
   document.querySelector('.content').scrollTop=0;
 }
 
-let scanCanvas=null, scanCtx=null, scanTimer=null, scanFrameCount=0;
-
-async function startCam(){
-  setCamStatus('scan','Starting camera...');
-
-  // Step 1: try rear camera with basic constraints (no focusMode — breaks iOS)
-  const tryStart=async(constraints)=>{
-    videoStream=await navigator.mediaDevices.getUserMedia(constraints);
-    const v=document.getElementById('video');
-    v.srcObject=videoStream;
-    // Don't await play() — just call it; mobile browsers handle it async
-    v.play().catch(()=>{});
-    // Wait for video to have real dimensions (up to 5s)
-    await new Promise((resolve,reject)=>{
-      let tries=0;
-      const check=setInterval(()=>{
-        tries++;
-        if(v.videoWidth>0&&v.videoHeight>0){clearInterval(check);resolve();}
-        if(tries>50){clearInterval(check);reject(new Error('Video did not load'));}
-      },100);
-    });
-  };
-
-  try{
-    try{
-      await tryStart({video:{facingMode:{exact:'environment'},width:{ideal:1280},height:{ideal:720}}});
-    }catch(e1){
-      // exact environment failed — try ideal
-      try{
-        await tryStart({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}});
-      }catch(e2){
-        // any camera
-        await tryStart({video:true});
-      }
-    }
-
-    scanCanvas=document.createElement('canvas');
-    scanCtx=scanCanvas.getContext('2d',{willReadFrequently:true});
-    scanFrameCount=0;
-
-    document.getElementById('cam-idle').style.display='none';
-    document.getElementById('cam-live').style.display='block';
-    scanning=true;
-
-    // Torch support check
-    const track=videoStream&&videoStream.getVideoTracks()[0];
-    if(track&&track.getCapabilities){
-      try{const caps=track.getCapabilities();if(caps.torch)document.getElementById('btn-torch').style.display='flex';}catch(_){}
-    }
-
-    setCamStatus('scan','Hold QR code steady in frame');
-    // 6fps — reliable on all mobile browsers
-    scanTimer=setInterval(tick,160);
-
-  }catch(e){
-    console.error('Camera failed:',e);
-    toast('Camera error: '+e.message,'err');
-    setCamStatus('warn','Camera failed — use manual URL entry below');
-  }
-}
-
-function stopCam(){
-  scanning=false;
-  if(scanTimer){clearInterval(scanTimer);scanTimer=null;}
-  if(rafId){cancelAnimationFrame(rafId);rafId=null;}
-  if(videoStream){videoStream.getTracks().forEach(t=>t.stop());videoStream=null;}
-  document.getElementById('cam-live').style.display='none';
-  document.getElementById('cam-idle').style.display='block';
-  document.getElementById('btn-torch').style.display='none';
-}
+// ZXing-based scanner — much more reliable on mobile than jsQR
+let zxingReader=null;
 
 function setCamStatus(state,msg){
   const dot=document.getElementById('pdot');
   const txt=document.getElementById('cmsg');
   if(dot) dot.className='pdot'+(state==='scan'?' scan':state==='found'?' found':state==='warn'?' warn':'');
-  if(txt) txt.textContent=msg;
+  if(txt) txt.textContent=msg||'';
 }
 
-function tick(){
-  if(!scanning) return;
-  const v=document.getElementById('video');
-  if(!v||v.videoWidth===0||v.videoHeight===0) return;
+async function startCam(){
+  setCamStatus('scan','Starting camera...');
+  try{
+    // ZXing BrowserMultiFormatReader handles camera + decode loop internally
+    zxingReader=new ZXing.BrowserMultiFormatReader();
 
-  scanFrameCount++;
-  // Update status every ~2s to show scanner is alive
-  if(scanFrameCount%12===0) setCamStatus('scan','Scanning... (frame '+scanFrameCount+')');
+    // Get available cameras and prefer rear-facing
+    const devices=await ZXing.BrowserMultiFormatReader.listVideoInputDevices();
+    let deviceId=undefined;
+    if(devices&&devices.length>0){
+      // Pick the last one — on mobile the rear camera is usually last
+      const rear=devices.find(d=>/(back|rear|environment|main)/i.test(d.label));
+      deviceId=rear?rear.deviceId:devices[devices.length-1].deviceId;
+    }
 
-  // Downscale to 640px max for speed — jsQR works fine at this resolution
-  const maxW=640;
-  const scale=Math.min(1,maxW/v.videoWidth);
-  const w=Math.round(v.videoWidth*scale)||640;
-  const h=Math.round(v.videoHeight*scale)||480;
+    document.getElementById('cam-idle').style.display='none';
+    document.getElementById('cam-live').style.display='block';
+    scanning=true;
+    setCamStatus('scan','Hold QR code steady in frame');
 
-  if(scanCanvas.width!==w||scanCanvas.height!==h){scanCanvas.width=w;scanCanvas.height=h;}
-  try{scanCtx.drawImage(v,0,0,w,h);}catch(e){return;}
-  const imageData=scanCtx.getImageData(0,0,w,h);
+    // decodeFromVideoDevice: ZXing manages the camera stream and decode loop
+    await zxingReader.decodeFromVideoDevice(deviceId,'video',(result,err)=>{
+      if(result){
+        const txt=result.getText().trim();
+        if(txt.length>4){
+          setCamStatus('found','QR detected!');
+          stopCam();
+          showUrl(txt);
+          processUrl(txt);
+        }
+      }
+      // err here is normal — ZXing throws NotFoundException on every frame with no QR
+    });
 
-  // attemptBoth handles dark-on-light and light-on-dark QR codes
-  const code=jsQR(imageData.data,imageData.width,imageData.height,{inversionAttempts:'attemptBoth'});
-
-  if(code&&code.data&&code.data.trim().length>4){
-    setCamStatus('found','QR detected!');
-    stopCam();
-    showUrl(code.data.trim());
-    processUrl(code.data.trim());
+  }catch(e){
+    console.error('Camera failed:',e);
+    setCamStatus('warn','Camera failed — try manual URL entry');
+    toast('Camera error: '+e.message,'err');
+    document.getElementById('cam-idle').style.display='block';
+    document.getElementById('cam-live').style.display='none';
   }
+}
+
+function stopCam(){
+  scanning=false;
+  if(zxingReader){
+    try{zxingReader.reset();}catch(_){}
+    zxingReader=null;
+  }
+  if(videoStream){videoStream.getTracks().forEach(t=>t.stop());videoStream=null;}
+  // Also stop any video element stream directly
+  const v=document.getElementById('video');
+  if(v&&v.srcObject){v.srcObject.getTracks().forEach(t=>t.stop());v.srcObject=null;}
+  document.getElementById('cam-live').style.display='none';
+  document.getElementById('cam-idle').style.display='block';
+  document.getElementById('btn-torch').style.display='none';
 }
 async function toggleTorch(){
   if(!videoStream) return;
