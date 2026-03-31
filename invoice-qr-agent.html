@@ -189,6 +189,7 @@ video{width:100%;height:100%;object-fit:cover;display:block}
           <div class="cstatus"><div class="pdot scan" id="pdot"></div><span id="cmsg">Align QR code within frame</span></div>
         </div>
         <button class="btn bghost mt12" onclick="stopCam()">Stop Camera</button>
+        <button class="btn bghost mt8" id="btn-torch" onclick="toggleTorch()" style="display:none">Torch On/Off</button>
       </div>
       <div id="cam-idle">
         <div class="cam-off-wrap">
@@ -347,42 +348,120 @@ function go(tab){
   document.querySelector('.content').scrollTop=0;
 }
 
+// Persistent canvas reused every frame — avoids GC pressure on mobile
+let scanCanvas=null, scanCtx=null, scanTimer=null;
+
 async function startCam(){
   try{
-    videoStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280},height:{ideal:1280}}});
+    // Request highest quality rear camera
+    const constraints={
+      video:{
+        facingMode:{ideal:'environment'},
+        width:{ideal:1920},
+        height:{ideal:1080},
+        focusMode:'continuous'
+      }
+    };
+    videoStream=await navigator.mediaDevices.getUserMedia(constraints);
     const v=document.getElementById('video');
-    v.srcObject=videoStream; await v.play();
+    v.srcObject=videoStream;
+    await v.play();
+
+    // Pre-create canvas once
+    scanCanvas=document.createElement('canvas');
+    scanCtx=scanCanvas.getContext('2d',{willReadFrequently:true});
+
     document.getElementById('cam-idle').style.display='none';
     document.getElementById('cam-live').style.display='block';
-    scanning=true; rafId=requestAnimationFrame(tick);
-  }catch(e){toast('Camera denied — use manual URL entry','err');}
+    scanning=true;
+
+    // Show torch button if device supports it
+    const track=videoStream.getVideoTracks()[0];
+    if(track&&track.getCapabilities&&track.getCapabilities().torch){
+      document.getElementById('btn-torch').style.display='flex';
+    }
+
+    // Use interval at 8fps instead of rAF — gives camera time to focus between reads
+    scanTimer=setInterval(tick, 120);
+  }catch(e){
+    console.error('Camera error:',e);
+    // Try fallback with minimal constraints
+    try{
+      videoStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+      const v=document.getElementById('video');
+      v.srcObject=videoStream;
+      await v.play();
+      scanCanvas=document.createElement('canvas');
+      scanCtx=scanCanvas.getContext('2d',{willReadFrequently:true});
+      document.getElementById('cam-idle').style.display='none';
+      document.getElementById('cam-live').style.display='block';
+      scanning=true;
+      scanTimer=setInterval(tick,120);
+    }catch(e2){
+      toast('Camera access denied. Enable camera permission in browser settings.','err');
+    }
+  }
 }
+
 function stopCam(){
   scanning=false;
+  if(scanTimer){clearInterval(scanTimer);scanTimer=null;}
   if(rafId){cancelAnimationFrame(rafId);rafId=null;}
   if(videoStream){videoStream.getTracks().forEach(t=>t.stop());videoStream=null;}
   document.getElementById('cam-live').style.display='none';
   document.getElementById('cam-idle').style.display='block';
+  document.getElementById('btn-torch').style.display='none';
 }
+
 function tick(){
   if(!scanning) return;
   const v=document.getElementById('video');
-  if(v.readyState<2){rafId=requestAnimationFrame(tick);return;}
-  const c=document.createElement('canvas');
-  c.width=v.videoWidth;c.height=v.videoHeight;
-  c.getContext('2d').drawImage(v,0,0);
-  const id=c.getContext('2d').getImageData(0,0,c.width,c.height);
-  const code=jsQR(id.data,id.width,id.height,{inversionAttempts:'dontInvert'});
-  if(code&&code.data){
+  // Wait until video has actual dimensions
+  if(!v||v.readyState<2||v.videoWidth===0||v.videoHeight===0) return;
+
+  // Scale down large frames for faster jsQR processing — 640px wide is plenty
+  const maxW=640;
+  const scale=Math.min(1, maxW/v.videoWidth);
+  const w=Math.round(v.videoWidth*scale);
+  const h=Math.round(v.videoHeight*scale);
+
+  if(scanCanvas.width!==w||scanCanvas.height!==h){
+    scanCanvas.width=w;
+    scanCanvas.height=h;
+  }
+  scanCtx.drawImage(v,0,0,w,h);
+  const imageData=scanCtx.getImageData(0,0,w,h);
+
+  // Try both normal and inverted (handles dark-on-light AND light-on-dark QR codes)
+  let code=jsQR(imageData.data,imageData.width,imageData.height,{inversionAttempts:'attemptBoth'});
+
+  if(code&&code.data&&code.data.length>0){
+    // Debounce — ignore if same code detected within 2s
+    if(code.data===tick._lastCode&&Date.now()-tick._lastTime<2000) return;
+    tick._lastCode=code.data;
+    tick._lastTime=Date.now();
+
     document.getElementById('pdot').className='pdot found';
     document.getElementById('cmsg').textContent='QR detected!';
     stopCam();
     showUrl(code.data);
     processUrl(code.data);
-    return;
   }
-  rafId=requestAnimationFrame(tick);
 }
+tick._lastCode=null;
+tick._lastTime=0;
+async function toggleTorch(){
+  if(!videoStream) return;
+  const track=videoStream.getVideoTracks()[0];
+  if(!track) return;
+  try{
+    const caps=track.getCapabilities();
+    if(!caps.torch){toast('Torch not available on this device','info');return;}
+    const settings=track.getSettings();
+    await track.applyConstraints({advanced:[{torch:!settings.torch}]});
+  }catch(e){toast('Torch not supported','info');}
+}
+
 function showUrl(url){
   const b=document.getElementById('surl');
   b.style.display='block';b.textContent='→ '+url;
@@ -772,10 +851,10 @@ renderHist();
 const od=document.getElementById('origin-display');
 if(od) od.textContent=location.origin;
 
-// Register service worker for PWA
-if('serviceWorker' in navigator){
+// Register service worker only when running from GitHub Pages (not Claude preview)
+if('serviceWorker' in navigator && location.hostname.includes('github.io')){
   window.addEventListener('load',()=>{
-    navigator.serviceWorker.register('sw.js')
+    navigator.serviceWorker.register('./sw.js')
       .then(r=>console.log('SW registered:',r.scope))
       .catch(e=>console.log('SW failed:',e));
   });
