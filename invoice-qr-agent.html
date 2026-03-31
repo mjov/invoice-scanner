@@ -397,12 +397,10 @@ function decodePFRBinary(vl){
     const version=bytes[0];
     let journal='';
     for(let i=1;i<=16;i++) journal+=String.fromCharCode(bytes[i]);
-    const totalPara=(bytes[17]|(bytes[18]<<8)|(bytes[19]<<16)|(bytes[20]<<24))>>>0;
-    const total=parseFloat((totalPara/100).toFixed(2));
-    const taxPara=(bytes[21]|(bytes[22]<<8)|(bytes[23]<<16)|(bytes[24]<<24))>>>0;
-    const taxBase=parseFloat((taxPara/100).toFixed(2));
-    const counter=(bytes[25]|(bytes[26]<<8)|(bytes[27]<<16)|(bytes[28]<<24))>>>0;
-    return {version,journal:journal.trim(),total,taxBase,counter,currency:'RSD'};
+    // offset 25: GRAND TOTAL (1/10000 RSD units)
+    const totalRaw=(bytes[25]|(bytes[26]<<8)|(bytes[27]<<16)|(bytes[28]<<24))>>>0;
+    const total=parseFloat((totalRaw/10000).toFixed(2));
+    return {version,journal:journal.trim(),total,currency:'RSD'};
   }catch(e){return null;}
 }
 
@@ -420,13 +418,10 @@ async function processUrl(url){
 
       const binary=vl?decodePFRBinary(vl):null;
       if(binary){
-        // RECTIFIED: Use template literals correctly to avoid SyntaxErrors
-        context = `CONFIRMED data decoded from signed PFR QR binary:\n` +
-                  `Journal #: ${binary.journal}\n` +
-                  `Total: ${binary.total} RSD\n` +
-                  `Tax field: ${binary.taxBase} RSD\n` +
-                  `Counter: ${binary.counter}\n` +
-                  `Version: ${binary.version}\n\n`;
+        context = 'CONFIRMED from cryptographically signed PFR binary payload:\n' +
+                  'Invoice Journal #: ' + binary.journal + '\n' +
+                  'TOTAL AMOUNT PAID (use this exact value for the "total" field, no other value): ' + binary.total + ' RSD\n' +
+                  'Invoice counter: ' + binary.counter + '\n\n';
       }
 
       // Fallback: fetch the verification HTML page and target the <pre> tag
@@ -514,44 +509,28 @@ async function processUrl(url){
       throw new Error('Could not parse AI response. Check browser console for the raw output.');
     }
 
-    // ── Total reconciliation ──────────────────────────────────────
-    // Step 1: For Serbian PFR, binary-decoded total is ground truth
+    // ── Total enforcement ─────────────────────────────────────────
+    // For PFR: binary total is cryptographically signed — ALWAYS wins, no conditions
     if(isSerbianFiscal){
       let vl2=null;
       try{vl2=new URL(url).searchParams.get('vl');}catch(_){}
       const bin=vl2?decodePFRBinary(vl2):null;
       if(bin){
-        // Always trust the binary total — it's cryptographically signed
-        inv.total=bin.total;
+        inv.total=bin.total;           // unconditional — ignore whatever Claude said
         inv.currency='RSD';
         if(!inv.invoiceNumber) inv.invoiceNumber=bin.journal;
         if(!inv.invoiceStandard) inv.invoiceStandard='PFR e-Racun';
       }
     }
 
-    // Step 2: If items exist, verify their sum matches the invoice total
-    // If Claude got item prices right but total wrong, fix the total
-    // If Claude got total right but item prices seem off, keep total as-is
-    if(inv.items&&inv.items.length>0){
-      const itemSum=parseFloat(inv.items
-        .reduce((acc,it)=>acc+(parseFloat(it.totalPrice)||0),0)
-        .toFixed(2));
-      if(itemSum>0){
-        if(!inv.total){
-          // No total at all — derive from items
-          inv.total=itemSum;
-        } else if(Math.abs(itemSum-inv.total)>0.10){
-          // Items sum doesn't match total — log and keep binary/AI total
-          // but annotate so user knows
-          console.warn('Item sum ('+itemSum+') differs from invoice total ('+inv.total+'). Keeping invoice total.');
-          if(!inv.notes) inv.notes='Note: sum of item prices ('+itemSum+' '+inv.currency+') differs from invoice total. Invoice total is used in column F.';
-        }
-      }
+    // For non-PFR: if no total, derive from item sum
+    if(!isSerbianFiscal&&(!inv.total)&&inv.items&&inv.items.length>0){
+      const itemSum=inv.items.reduce((acc,it)=>acc+(parseFloat(it.totalPrice)||0),0);
+      if(itemSum>0) inv.total=parseFloat(itemSum.toFixed(2));
     }
 
-    // Step 3: Ensure total is always a clean number, never a string
+    // Clean all numbers — no floats leaking as strings or with excess decimals
     if(inv.total!=null) inv.total=parseFloat(parseFloat(inv.total).toFixed(2));
-    // Same for item totals
     if(inv.items) inv.items=inv.items.map(it=>({
       ...it,
       totalPrice:it.totalPrice!=null?parseFloat(parseFloat(it.totalPrice).toFixed(2)):null,
