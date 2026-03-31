@@ -579,8 +579,11 @@ async function saveToSheets(){
       currentInv.taxBase??'',currentInv.vatAmount??'',currentInv.total??'',currentInv.currency||'',
       currentInv.invoiceType||'',currentInv.dueDate||'',currentInv.sourceUrl||'',new Date().toISOString()
     ];
-    const tab=encodeURIComponent((cfg.sheetTab||'Invoices')+'!A:L');
-    const r=await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${cfg.sheetId}/values/${tab}:append?valueInputOption=USER_ENTERED`,{
+    // Sheets API range: quote tab name with single quotes to handle spaces/special chars
+    // Only encode the tab name itself, NOT the ! or column range
+    const tabName=cfg.sheetTab||'Invoices';
+    const range=encodeURIComponent("'"+tabName+"'")+'!A:L';
+    const r=await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${cfg.sheetId}/values/${range}:append?valueInputOption=USER_ENTERED`,{
       method:'POST',
       headers:{'Authorization':'Bearer '+oauthToken,'Content-Type':'application/json'},
       body:JSON.stringify({values:[row]})
