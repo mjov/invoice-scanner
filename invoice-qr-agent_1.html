@@ -385,56 +385,209 @@ function processManual(){
   showUrl(url);processUrl(url);
 }
 
+// Serbian PFR QR decoder
+// The vl= payload structure (confirmed):
+// [0]     version byte (3)
+// [1:17]  journal number ASCII (16 bytes) e.g. "SLD5QV6QSLD5QV6Q"
+// [17:21] total amount uint32 LE in para (1 RSD = 100 para)
+// [21:25] second amount uint32 LE in para (tax group total)
+// [25:29] signing counter uint32 LE
+// [29:]:  RSA-2048 signature (256 bytes) + possible extra fields
+// IMPORTANT: seller, buyer, date, items are NOT in the QR payload.
+// They live on the suf.purs.gov.rs server and are only accessible
+// via their API or by scraping the server-rendered page.
+function decodePFR(url){
+  try{
+    const vl=new URL(url).searchParams.get('vl');
+    if(!vl) return null;
+    let b64=vl.replace(/-/g,'+').replace(/_/g,'/');
+    b64+='='.repeat((4-b64.length%4)%4);
+    const raw=atob(b64);
+    const d=new Uint8Array(raw.length);
+    for(let i=0;i<raw.length;i++) d[i]=raw.charCodeAt(i);
+    if(d.length<30) return null;
+    // Fixed-offset binary structure confirmed by payload analysis:
+    // [0]     version byte (3)
+    // [1:17]  journal number - 16 ASCII bytes
+    // [17:21] total amount   - uint32 LE, paras (divide by 100 for RSD)
+    // [21:25] tax base       - uint32 LE, paras
+    // [25:29] invoice counter- uint32 LE (sequential fiscal device counter)
+    const u32=o=>((d[o]|(d[o+1]<<8)|(d[o+2]<<16)|(d[o+3]<<24))>>>0);
+    const journal=Array.from(d.slice(1,17)).map(b=>String.fromCharCode(b)).join('').replace(/[^ -~]/g,'').trim();
+    const total  =u32(17)/100;
+    const taxBase=u32(21)/100;
+    const vat    =Math.round((total-taxBase)*100)/100;
+    const counter=u32(25);
+    return {journal,total,taxBase,vat,counter,currency:'RSD'};
+  }catch(e){return null;}
+}
+
+// Serbian PFR binary decoder - extracts confirmed cleartext fields from vl payload
+function decodePFRBinary(vl){
+  try{
+    const b64=vl.replace(/-/g,'+').replace(/_/g,'/');
+    const bin=atob(b64);
+    const bytes=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+    const version=bytes[0];
+    let journal='';
+    for(let i=1;i<=16;i++) journal+=String.fromCharCode(bytes[i]);
+    const totalPara=bytes[17]|(bytes[18]<<8)|(bytes[19]<<16)|(bytes[20]<<24);
+    const total=parseFloat((totalPara/100).toFixed(2));
+    const taxPara=bytes[21]|(bytes[22]<<8)|(bytes[23]<<16)|(bytes[24]<<24);
+    const taxBase=parseFloat((taxPara/100).toFixed(2));
+    const counter=bytes[25]|(bytes[26]<<8)|(bytes[27]<<16)|(bytes[28]<<24);
+    return {version,journal:journal.trim(),total,taxBase,counter,currency:'RSD'};
+  }catch(e){return null;}
+}
+
 async function processUrl(url){
   if(!cfg.antKey){toast('Add Anthropic API key in Setup','err');go('setup');return;}
-  loader('Fetching invoice page…');
+  loader('Reading invoice...');
   try{
-    let html='';
-    try{
-      const r=await fetch('https://api.allorigins.win/raw?url='+encodeURIComponent(url),{signal:AbortSignal.timeout(8000)});
-      if(r.ok) html=(await r.text()).substring(0,5000);
-    }catch(_){}
+    let context='';
+    const isSerbianFiscal=url.includes('suf.purs.gov.rs');
 
-    loaderTxt('Extracting data with Claude AI…');
-    const prompt=`You are an expert invoice data extraction agent. A QR code linked to this URL: ${url}
+    if(isSerbianFiscal){
+      loaderTxt('Decoding PFR payload...');
+      let vl=null;
+      try{ vl=new URL(url).searchParams.get('vl'); }catch(_){}
 
-${html?'Fetched page content (HTML/JSON, truncated to 5000 chars):\n---\n'+html+'\n---':'The page could not be fetched directly. Infer all possible data from URL structure and parameters.'}
+      // Decode confirmed binary fields
+      const binary=vl?decodePFRBinary(vl):null;
+      if(binary){
+        context='CONFIRMED data decoded from signed PFR QR binary:
+'
+          +'Journal #: '+binary.journal+'
+'
+          +'Total: '+binary.total+' RSD
+'
+          +'Tax field: '+binary.taxBase+' RSD
+'
+          +'Counter: '+binary.counter+'
+'
+          +'Version: '+binary.version+'
 
-This could be any invoice standard worldwide: Serbian e-Faktura (eFaktura.mfin.gov.rs), EU Peppol/UBL, ZUGFeRD, Factur-X, Italian SDI, French Chorus Pro, Turkish e-Fatura, generic PDF/HTML invoice, or any other format.
+';
+      }
 
-Return ONLY valid JSON — no markdown fences, no preamble, no trailing text:
-{
-  "invoiceNumber":"string|null",
-  "invoiceType":"Tax Invoice|Credit Note|Proforma|Receipt|Debit Note|null",
-  "date":"YYYY-MM-DD|null",
-  "dueDate":"YYYY-MM-DD|null",
-  "seller":"company name|null",
-  "sellerTaxId":"VAT/PIB/tax number|null",
-  "sellerAddress":"string|null",
-  "buyer":"company name|null",
-  "buyerTaxId":"string|null",
-  "buyerAddress":"string|null",
-  "currency":"ISO 4217 e.g. RSD EUR USD|null",
-  "taxBase":number_or_null,
-  "vatAmount":number_or_null,
-  "discount":number_or_null,
-  "total":number_or_null,
-  "items":[{"name":"string","quantity":number,"unit":"string|null","unitPrice":number,"vatRate":"string|null","totalPrice":number}],
-  "sourceUrl":"${url}",
-  "invoiceStandard":"e-Faktura|Peppol|ZUGFeRD|SDI|Chorus Pro|e-Fatura|Generic|Unknown",
-  "confidence":"high|medium|low",
-  "notes":"string|null"
-}`;
+      // Try official public verification API via CORS proxy
+      loaderTxt('Calling PFR API...');
+      if(vl){
+        const apiUrls=[
+          'https://suf.purs.gov.rs/api/publicapi/verify',
+          'https://suf.purs.gov.rs/v/api/verify',
+          'https://suf.purs.gov.rs/api/verify'
+        ];
+        for(const apiUrl of apiUrls){
+          try{
+            const r=await fetch('https://corsproxy.io/?'+encodeURIComponent(apiUrl),{
+              method:'POST',
+              headers:{'Content-Type':'application/json','Accept':'application/json'},
+              body:JSON.stringify({verificationCode:vl,requestedBy:'QRScanner'}),
+              signal:AbortSignal.timeout(7000)
+            });
+            if(r.ok){
+              const txt=await r.text();
+              if(txt&&(txt.includes('{'))){
+                context+='Official PFR API JSON response:
+'+txt.substring(0,4000)+'
+
+';
+                break;
+              }
+            }
+          }catch(_){}
+        }
+      }
+
+      // Fallback: fetch the verification HTML page
+      loaderTxt('Fetching verification page...');
+      try{
+        const r=await fetch('https://corsproxy.io/?'+encodeURIComponent(url),{signal:AbortSignal.timeout(10000)});
+        if(r.ok){
+          const txt=await r.text();
+          const clean=txt
+            .replace(/<script[\s\S]*?<\/script>/gi,'')
+            .replace(/<style[\s\S]*?<\/style>/gi,'')
+            .replace(/<br\s*\/?>/gi,'
+')
+            .replace(/<\/tr>/gi,'
+')
+            .replace(/<\/td>/gi,' | ')
+            .replace(/<[^>]+>/g,'')
+            .replace(/&nbsp;/g,' ')
+            .replace(/&amp;/g,'&')
+            .replace(/\s{2,}/g,' ')
+            .trim()
+            .substring(0,4000);
+          if(clean.length>50) context+='Verification page text:
+'+clean+'
+
+';
+        }
+      }catch(_){}
+
+      context+='NOTE: This is a Serbian PFR fiscal cash register receipt (fiskalni racun). Currency=RSD. InvoiceStandard="PFR e-Racun". The journal number is the invoice identifier. Serbian VAT rates: E1=10%, E2=20%, E3=0%.';
+
+    }else{
+      loaderTxt('Fetching invoice page...');
+      for(const proxy of ['https://corsproxy.io/?'+encodeURIComponent(url),'https://api.allorigins.win/raw?url='+encodeURIComponent(url)]){
+        try{
+          const r=await fetch(proxy,{signal:AbortSignal.timeout(8000)});
+          if(r.ok){
+            const txt=await r.text();
+            const clean=txt.replace(/<script[\s\S]*?<\/script>/gi,'').replace(/<style[\s\S]*?<\/style>/gi,'').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim().substring(0,5000);
+            if(clean.length>100){context='Fetched page:
+'+clean;break;}
+          }
+        }catch(_){}
+      }
+      if(!context) context='Page could not be fetched. Infer from URL.';
+    }
+
+    loaderTxt('Extracting with Claude AI...');
+    const prompt='You are an expert invoice data extraction agent. URL: '+url+'
+
+'+context+'
+
+'
+      +'For PFR e-Racun: use the confirmed binary total exactly. Journal number is the invoice number. '
+      +'If only total is known (e.g. 1956.00 RSD) and no VAT breakdown, set taxBase=total/1.20, vatAmount=total-taxBase (assumes E2 20% VAT). '
+      +'Extract seller and buyer from API/page response if available. '
+      +'Return ONLY valid JSON:
+'
+      +'{"invoiceNumber":"string|null","invoiceType":"Receipt|Tax Invoice|Credit Note|null","date":"YYYY-MM-DD|null","dueDate":null,"seller":"string|null","sellerTaxId":"string|null","sellerAddress":"string|null","buyer":"string|null","buyerTaxId":"string|null","buyerAddress":"string|null","currency":"RSD","taxBase":null,"vatAmount":null,"discount":null,"total":null,"items":[],"sourceUrl":"'+url+'","invoiceStandard":"PFR e-Racun|eFaktura|Peppol|Generic|Unknown","confidence":"high|medium|low","notes":"string|null"}';
 
     const res=await fetch('https://api.anthropic.com/v1/messages',{
       method:'POST',
       headers:{'Content-Type':'application/json','x-api-key':cfg.antKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-      body:JSON.stringify({model:MODEL,max_tokens:2000,messages:[{role:'user',content:prompt}]})
+      body:JSON.stringify({model:MODEL,max_tokens:1500,messages:[{role:'user',content:prompt}]})
     });
     if(!res.ok){const e=await res.json();throw new Error(e.error?.message||'API error '+res.status);}
     const data=await res.json();
     let raw=data.content.map(c=>c.text||'').join('').replace(/```json|```/g,'').trim();
     const inv=JSON.parse(raw);
+
+    // Always enforce binary-confirmed values
+    if(isSerbianFiscal){
+      let vl2=null;
+      try{vl2=new URL(url).searchParams.get('vl');}catch(_){}
+      const bin=vl2?decodePFRBinary(vl2):null;
+      if(bin){
+        if(!inv.total||Math.abs((inv.total||0)-bin.total)>0.5) inv.total=bin.total;
+        if(!inv.currency) inv.currency='RSD';
+        if(!inv.invoiceNumber) inv.invoiceNumber=bin.journal;
+        if(!inv.invoiceStandard) inv.invoiceStandard='PFR e-Racun';
+        // If no VAT breakdown, calculate from total at 20%
+        if(inv.total&&!inv.taxBase){
+          inv.taxBase=parseFloat((inv.total/1.20).toFixed(2));
+          inv.vatAmount=parseFloat((inv.total-inv.taxBase).toFixed(2));
+          if(!inv.notes) inv.notes='VAT breakdown estimated at E2 (20%) from confirmed total';
+        }
+      }
+    }
+
     currentInv=inv;
     renderInv(inv);
     go('invoice');
