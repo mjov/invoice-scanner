@@ -301,7 +301,7 @@ video{width:100%;height:100%;object-fit:cover;display:block}
         <div class="col-map">
           <span class="c">A</span> Date &nbsp; <span class="c">B</span> Invoice # &nbsp; <span class="c">C</span> Seller &nbsp; <span class="c">D</span> Type<br>
           <span class="c">E</span> Currency &nbsp; <span class="c">F</span> Total &nbsp; <span class="c">G</span> Source URL &nbsp; <span class="c">H</span> Scanned At<br>
-          <span class="c">I</span> Item Name &nbsp; <span class="c">J</span> Qty &nbsp; <span class="c">K</span> Item Total
+          <span class="c">I</span> Item Name &nbsp; <span class="c">J</span> Unit &nbsp; <span class="c">K</span> Qty &nbsp; <span class="c">L</span> Item Total
         </div>
         <div class="hint" style="margin-top:8px">One row per line item. Invoice header fields (A–H) repeat on each row for easy filtering. If no line items are detected, one summary row is saved.</div>
       </div>
@@ -473,6 +473,7 @@ async function processUrl(url){
       `RULES:\n` +
       `- 'total' = the GRAND TOTAL of the entire invoice (final amount paid). Never set it to a single item price.\n` +
       `- 'items[].totalPrice' = price for that line item only (quantity x unitPrice).\n` +
+      `- 'items[].name' = clean item name ONLY — no unit suffix (KOM, KG etc). Put unit in the 'unit' field.\n` +
       `- Sum of all items[].totalPrice should equal or approximate 'total'.\n` +
       `- For PFR e-Racun: the CONFIRMED binary total is in the context above — use it exactly for the 'total' field.\n` +
       `- Extract seller name and date from receipt/page content if available.\n` +
@@ -585,7 +586,7 @@ async function saveToSheets(){
     const inv=currentInv;
     const scannedAt=new Date().toISOString();
     // Header fields repeated on every row for easy filtering/pivoting
-    // Columns: A Date | B Invoice# | C Seller | D Type | E Currency | F Total | G Source URL | H Scanned At | I Item Name | J Qty | K Item Total
+    // Columns: A Date | B Invoice# | C Seller | D Type | E Currency | F Total | G Source URL | H Scanned At | I Item Name | J Unit | K Qty | L Item Total
     const header=[
       inv.date||'',
       inv.invoiceNumber||'',
@@ -597,22 +598,34 @@ async function saveToSheets(){
       scannedAt
     ];
 
+    // Strip any unit suffix Claude may have appended to item name (e.g. "Hleb KOM", "Meso KG")
+    const knownUnits=/\b(KOM|KG|LIT|L|M|M2|M3|PAR|PAK|SET|KUT|BOC|GR|T|H|MIN|DAN|KWH|PCE|PCS|kom|kg|lit|l|m|gr|pak|par|set|kut|boc)\b\.?$/i;
+    function cleanItemName(raw){
+      return (raw||'').replace(knownUnits,'').trim();
+    }
+    function extractUnit(rawName, existingUnit){
+      if(existingUnit&&existingUnit.trim()) return existingUnit.trim().toUpperCase();
+      const m=(rawName||'').match(knownUnits);
+      return m?m[0].toUpperCase().replace('.',''):'';
+    }
+
     let rows=[];
     if(inv.items&&inv.items.length>0){
-      // One row per line item
+      // One row per line item — I=name, J=unit, K=qty, L=item total
       rows=inv.items.map(it=>[
         ...header,
-        it.name||'',
+        cleanItemName(it.name),
+        extractUnit(it.name, it.unit),
         it.quantity??'',
         it.totalPrice??''
       ]);
     }else{
       // No line items — save single summary row with empty item columns
-      rows=[[ ...header, '','','' ]];
+      rows=[[ ...header, '','','','' ]];
     }
 
     const tabName=cfg.sheetTab||'Invoices';
-    const range=encodeURIComponent("'"+tabName+"'")+'!A:K';
+    const range=encodeURIComponent("'"+tabName+"'")+'!A:L';
     const r=await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${cfg.sheetId}/values/${range}:append?valueInputOption=USER_ENTERED`,{
       method:'POST',
       headers:{'Authorization':'Bearer '+oauthToken,'Content-Type':'application/json'},
