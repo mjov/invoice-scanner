@@ -475,11 +475,14 @@ async function processUrl(url){
     // RECTIFIED: Used template literals directly for the prompt building
     const prompt = `You are an expert invoice data extraction agent. URL: ${url}\n\n` +
       `${context}\n\n` +
-      `For PFR e-Racun: use the confirmed binary total exactly. Journal number is the invoice number. ` +
-      `If only total is known (e.g. 1956.00 RSD) and no VAT breakdown, set taxBase=total/1.20, vatAmount=total-taxBase (assumes E2 20% VAT). ` +
-      `Extract seller and buyer from API/page response if available. ` +
+      `RULES:\n` +
+      `- 'total' = the GRAND TOTAL of the entire invoice (final amount paid). Never set it to a single item price.\n` +
+      `- 'items[].totalPrice' = price for that line item only (quantity x unitPrice).\n` +
+      `- Sum of all items[].totalPrice should equal or approximate 'total'.\n` +
+      `- For PFR e-Racun: the CONFIRMED binary total is in the context above — use it exactly for the 'total' field.\n` +
+      `- Extract seller name and date from receipt/page content if available.\n` +
       `CRITICAL: Respond with ONLY a raw JSON object. No explanation, no markdown, no code fences. Start with { and end with }.\n` +
-      `{"invoiceNumber":"string|null","invoiceType":"Receipt|Tax Invoice|Credit Note|null","date":"YYYY-MM-DD|null","dueDate":null,"seller":"string|null","sellerTaxId":"string|null","sellerAddress":"string|null","buyer":"string|null","buyerTaxId":"string|null","buyerAddress":"string|null","currency":"RSD","taxBase":null,"vatAmount":null,"discount":null,"total":null,"items":[{"name":"string","quantity":number,"unit":"string","totalPrice":number}],"sourceUrl":"${url}","invoiceStandard":"PFR e-Racun|eFaktura|Peppol|Generic|Unknown","confidence":"high|medium|low","notes":"string|null"}`;
+      `{"invoiceNumber":"string|null","invoiceType":"Receipt|Tax Invoice|Credit Note|null","date":"YYYY-MM-DD|null","dueDate":null,"seller":"string|null","sellerTaxId":"string|null","sellerAddress":"string|null","buyer":"string|null","buyerTaxId":"string|null","buyerAddress":"string|null","currency":"RSD","taxBase":null,"vatAmount":null,"discount":null,"total":null,"items":[{"name":"string","quantity":number,"unit":"string|null","totalPrice":number}],"sourceUrl":"${url}","invoiceStandard":"PFR e-Racun|eFaktura|Peppol|Generic|Unknown","confidence":"high|medium|low","notes":"string|null"}`;
 
     const res=await fetch('https://api.anthropic.com/v1/messages',{
       method:'POST',
@@ -511,23 +514,49 @@ async function processUrl(url){
       throw new Error('Could not parse AI response. Check browser console for the raw output.');
     }
 
-    // Always enforce binary-confirmed values
+    // ── Total reconciliation ──────────────────────────────────────
+    // Step 1: For Serbian PFR, binary-decoded total is ground truth
     if(isSerbianFiscal){
       let vl2=null;
       try{vl2=new URL(url).searchParams.get('vl');}catch(_){}
       const bin=vl2?decodePFRBinary(vl2):null;
       if(bin){
-        if(!inv.total||Math.abs((inv.total||0)-bin.total)>0.5) inv.total=bin.total;
-        if(!inv.currency) inv.currency='RSD';
+        // Always trust the binary total — it's cryptographically signed
+        inv.total=bin.total;
+        inv.currency='RSD';
         if(!inv.invoiceNumber) inv.invoiceNumber=bin.journal;
         if(!inv.invoiceStandard) inv.invoiceStandard='PFR e-Racun';
-        if(inv.total&&!inv.taxBase){
-          inv.taxBase=parseFloat((inv.total/1.2).toFixed(2));
-          inv.vatAmount=parseFloat((inv.total-inv.taxBase).toFixed(2));
-          if(!inv.notes) inv.notes='VAT breakdown estimated at E2 (20%) from confirmed total';
+      }
+    }
+
+    // Step 2: If items exist, verify their sum matches the invoice total
+    // If Claude got item prices right but total wrong, fix the total
+    // If Claude got total right but item prices seem off, keep total as-is
+    if(inv.items&&inv.items.length>0){
+      const itemSum=parseFloat(inv.items
+        .reduce((acc,it)=>acc+(parseFloat(it.totalPrice)||0),0)
+        .toFixed(2));
+      if(itemSum>0){
+        if(!inv.total){
+          // No total at all — derive from items
+          inv.total=itemSum;
+        } else if(Math.abs(itemSum-inv.total)>0.10){
+          // Items sum doesn't match total — log and keep binary/AI total
+          // but annotate so user knows
+          console.warn('Item sum ('+itemSum+') differs from invoice total ('+inv.total+'). Keeping invoice total.');
+          if(!inv.notes) inv.notes='Note: sum of item prices ('+itemSum+' '+inv.currency+') differs from invoice total. Invoice total is used in column F.';
         }
       }
     }
+
+    // Step 3: Ensure total is always a clean number, never a string
+    if(inv.total!=null) inv.total=parseFloat(parseFloat(inv.total).toFixed(2));
+    // Same for item totals
+    if(inv.items) inv.items=inv.items.map(it=>({
+      ...it,
+      totalPrice:it.totalPrice!=null?parseFloat(parseFloat(it.totalPrice).toFixed(2)):null,
+      quantity:it.quantity!=null?parseFloat(it.quantity):null
+    }));
 
     currentInv=inv;
     renderInv(inv);
