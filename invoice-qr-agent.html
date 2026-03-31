@@ -478,7 +478,7 @@ async function processUrl(url){
       `For PFR e-Racun: use the confirmed binary total exactly. Journal number is the invoice number. ` +
       `If only total is known (e.g. 1956.00 RSD) and no VAT breakdown, set taxBase=total/1.20, vatAmount=total-taxBase (assumes E2 20% VAT). ` +
       `Extract seller and buyer from API/page response if available. ` +
-      `Return ONLY valid JSON:\n` +
+      `CRITICAL: Respond with ONLY a raw JSON object. No explanation, no markdown, no code fences. Start with { and end with }.\n` +
       `{"invoiceNumber":"string|null","invoiceType":"Receipt|Tax Invoice|Credit Note|null","date":"YYYY-MM-DD|null","dueDate":null,"seller":"string|null","sellerTaxId":"string|null","sellerAddress":"string|null","buyer":"string|null","buyerTaxId":"string|null","buyerAddress":"string|null","currency":"RSD","taxBase":null,"vatAmount":null,"discount":null,"total":null,"items":[{"name":"string","quantity":number,"unit":"string","totalPrice":number}],"sourceUrl":"${url}","invoiceStandard":"PFR e-Racun|eFaktura|Peppol|Generic|Unknown","confidence":"high|medium|low","notes":"string|null"}`;
 
     const res=await fetch('https://api.anthropic.com/v1/messages',{
@@ -489,14 +489,27 @@ async function processUrl(url){
         'anthropic-version':'2023-06-01',
         'anthropic-dangerous-direct-browser-access':'true'
       },
-      body:JSON.stringify({model:MODEL,max_tokens:1500,messages:[{role:'user',content:prompt}]})
+      body:JSON.stringify({model:MODEL,max_tokens:2048,messages:[{role:'user',content:prompt}]})
     });
     
     if(!res.ok){const e=await res.json();throw new Error(e.error?.message||'API error '+res.status);}
     
     const data=await res.json();
-    let raw=data.content.map(c=>c.text||'').join('').replace(/```json|```/g,'').trim();
-    const inv=JSON.parse(raw);
+    let raw=data.content.map(c=>c.text||'').join('').trim();
+    raw=raw.replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+    const jsonStart=raw.indexOf('{');
+    const jsonEnd=raw.lastIndexOf('}');
+    if(jsonStart===-1||jsonEnd===-1){
+      console.error('No JSON in Claude response:',raw);
+      throw new Error('AI returned no structured data. Response: '+raw.substring(0,300));
+    }
+    raw=raw.substring(jsonStart,jsonEnd+1);
+    let inv;
+    try{inv=JSON.parse(raw);}
+    catch(pe){
+      console.error('JSON parse failed. Raw was:',raw);
+      throw new Error('Could not parse AI response. Check browser console for the raw output.');
+    }
 
     // Always enforce binary-confirmed values
     if(isSerbianFiscal){
